@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.repair;
 
+import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -30,6 +31,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -38,6 +40,7 @@ import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -73,6 +76,9 @@ import org.apache.cassandra.utils.asserts.SyncTaskListAssert;
 import static org.apache.cassandra.utils.asserts.SyncTaskAssert.assertThat;
 import static org.apache.cassandra.utils.asserts.SyncTaskListAssert.assertThat;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class RepairJobTest
 {
@@ -103,6 +109,10 @@ public class RepairJobTest
     // memory retention from CASSANDRA-14096
     private static class MeasureableRepairSession extends RepairSession
     {
+        private final CountDownLatch validationCompleteReached = new CountDownLatch(1);
+
+        private volatile boolean simulateValidationsOutstanding;
+
         private final List<Callable<?>> syncCompleteCallbacks = new ArrayList<>();
 
         public MeasureableRepairSession(UUID parentRepairSession, UUID id, CommonRange commonRange, String keyspace,
@@ -139,6 +149,30 @@ public class RepairJobTest
         public void registerSyncCompleteCallback(Callable<?> callback)
         {
             syncCompleteCallbacks.add(callback);
+        }
+
+        void simulateValidationsOutstanding()
+        {
+            simulateValidationsOutstanding = true;
+        }
+
+        @Override
+        public void validationComplete(RepairJobDesc desc, InetAddressAndPort endpoint, MerkleTrees trees)
+        {
+            validationCompleteReached.countDown();
+
+            // Do not delegate the validation complete to parent to simulate that the call is still outstanding
+            if (simulateValidationsOutstanding)
+            {
+                return;
+            }
+            super.validationComplete(desc, endpoint, trees);
+        }
+
+        void waitUntilReceivedFirstValidationComplete()
+        {
+            boolean isFirstValidationCompleteReceived = Uninterruptibles.awaitUninterruptibly(validationCompleteReached, TEST_TIMEOUT_S, TimeUnit.SECONDS);
+            assertTrue("First validation completed", isFirstValidationCompleteReceived);
         }
     }
 
@@ -693,6 +727,43 @@ public class RepairJobTest
 
         assertStreamRangeFromEither(tasks, RANGE_3, addr2, addr1, addr3);
         assertStreamRangeFromEither(tasks, RANGE_1, addr2, addr1, addr3);
+    }
+
+    /**
+     * Verify that repair job will be released after force shutdown on the session
+     */
+    @Test
+    public void releaseThreadAfterSessionForceShutdown() throws Throwable
+    {
+        Map<InetAddressAndPort, MerkleTrees> mockTrees = new HashMap<>();
+        mockTrees.put(addr1, createInitialTree(false));
+        mockTrees.put(addr2, createInitialTree(false));
+        mockTrees.put(addr3, createInitialTree(false));
+
+        List<Message<?>> observedMessages = new ArrayList<>();
+        interceptRepairMessages(mockTrees, observedMessages);
+
+        session.simulateValidationsOutstanding();
+
+        Thread jobThread = new Thread(() -> job.run());
+        jobThread.start();
+
+        session.waitUntilReceivedFirstValidationComplete();
+
+        session.forceShutdown(new Exception("force shutdown for testing"));
+
+        jobThread.join(TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_S));
+        assertFalse("expect that the job thread has been finished and not waiting on the outstanding validations forever", jobThread.isAlive());
+
+        // RepairJob should send out 3 x SNAPSHOTS -> 1 x VALIDATION -> done
+        // Only one VALIDATION because we shutdown the session after first validation
+        List<Verb> expectedTypes = new ArrayList<>();
+        for (int i = 0; i < 3; i++)
+            expectedTypes.add(Verb.SNAPSHOT_MSG);
+
+        expectedTypes.add(Verb.VALIDATION_REQ);
+
+        assertThat(observedMessages).extracting(Message::verb).containsExactlyElementsOf(expectedTypes);
     }
 
     // Asserts that ranges are streamed from one of the nodes but not from the both
